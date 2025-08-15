@@ -39,14 +39,13 @@ def upsert_many_batched(db_path: str, table: str, rows: Iterable[Tuple[str,str,s
                 source=excluded.source,
                 updated_at=datetime('now')"""
     batch = []
-    count = 0
     for r in rows:
         batch.append(r)
         if len(batch) >= batch_size:
-            cur.executemany(sql, batch); conn.commit(); count += len(batch); batch.clear()
+            cur.executemany(sql, batch); conn.commit(); batch.clear()
     if batch:
-        cur.executemany(sql, batch); conn.commit(); count += len(batch)
-    conn.close(); return count
+        cur.executemany(sql, batch); conn.commit()
+    conn.close()
 
 def replace_all(db_path: str, table: str, rows):
     conn = sqlite3.connect(db_path); cur = conn.cursor()

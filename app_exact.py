@@ -3,13 +3,13 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 import pandas as pd
-import os, re, csv, zipfile, importlib
+import os, re, csv, zipfile, importlib, hashlib
 
 from PIL import Image, ImageTk
 
-try: import openpyxl  # noqa
+try: import openpyxl
 except Exception: openpyxl = None
-try: import xlrd      # noqa
+try: import xlrd
 except Exception: xlrd = None
 
 from db_helper import ensure_db, upsert_many_batched, replace_all, query
@@ -17,7 +17,8 @@ from db_helper import ensure_db, upsert_many_batched, replace_all, query
 APP_DIR = Path(__file__).parent
 DB_PATH = str(APP_DIR / "codebook.db")
 
-COMMON_ENCODINGS = ["utf-8-sig","utf-8","gbk","gb18030","utf-16","utf-16le","utf-16be","latin1"]
+# r6f: add HK/TW encodings
+COMMON_ENCODINGS = ["utf-8-sig","utf-8","gbk","gb18030","utf-16","utf-16le","utf-16be","latin1","big5hkscs","big5","cp950"]
 COMMON_DELIMS = ["|","\t",",",";"," "]
 
 def _cjk_ratio(text: str) -> float:
@@ -25,6 +26,12 @@ def _cjk_ratio(text: str) -> float:
     total = len(text)
     cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
     return cjk / max(1, total)
+
+def _garble_ratio(text: str) -> float:
+    if not text: return 0.0
+    suspects = set(list("鍙鐢閲鑱鈥锛鎴鏂鍗闆閲閬瀛灏鏍鏄鐭鐪鍦鏄瑙鎵鐐鐩鏃"))
+    bad = sum(1 for ch in text if ch in suspects or ord(ch)==0xfffd)
+    return bad / max(1, len(text))
 
 def _series_cjk_ratio(ser) -> float:
     try:
@@ -35,11 +42,29 @@ def _series_cjk_ratio(ser) -> float:
     except Exception:
         return 0.0
 
+def _df_encoding_score(df):
+    try:
+        cols = list(df.columns)
+        pref = [c for c in cols if str(c).upper()=="LNAME"] or [c for c in cols if "名称" in str(c)] or cols
+        s = df[pref[0]].astype(str).fillna("").head(200)
+        sample = " ".join(s.tolist())
+    except Exception:
+        try:
+            sample = df.head(200).astype(str).fillna("").agg("|".join, axis=1).str.cat(sep="")
+        except Exception:
+            sample = ""
+    ck = _cjk_ratio(sample)
+    gb = _garble_ratio(sample)
+    ascii_ratio = sum(1 for ch in sample if ord(ch)<128) / max(1, len(sample))
+    return ck + 0.05*ascii_ratio - 0.7*gb
+
 def fix_mojibake(s: str) -> str:
     if s is None: return s
     s0 = str(s)
     cands = [s0]
-    pairs = [("latin1","utf-8"),("latin1","gbk"),("gbk","utf-8"),("utf-8","gbk")]
+    # r6f: more repair paths
+    pairs = [("latin1","utf-8"),("latin1","gbk"),("gbk","utf-8"),("utf-8","gbk"),
+             ("cp950","utf-8"),("big5","utf-8"),("big5hkscs","utf-8")]
     for frm, to in pairs:
         try:
             cands.append(s0.encode(frm, errors="ignore").decode(to, errors="ignore"))
@@ -63,13 +88,14 @@ def sniff_delimiter(text: str):
                 best, bestn = d, n
         return best or ","
 
-def try_parse_csv(path: str, header="auto"):  # r6: encoding auto-score + mojibake safe
+def try_parse_csv(path: str, header="auto", *, force_encoding: str = None):
     from io import TextIOWrapper, BytesIO
     data = Path(path).read_bytes()
     last_err = None
     best_df = None
     best_score = -1.0
-    for enc in COMMON_ENCODINGS:
+    encodings = [force_encoding] if force_encoding else COMMON_ENCODINGS
+    for enc in encodings:
         try:
             bio = BytesIO(data); tio = TextIOWrapper(bio, encoding=enc, newline="")
             df = pd.read_csv(tio, dtype=str, engine="python", sep=None, on_bad_lines="skip", header=0)
@@ -78,16 +104,7 @@ def try_parse_csv(path: str, header="auto"):  # r6: encoding auto-score + mojiba
                 bio = BytesIO(data); tio = TextIOWrapper(bio, encoding=enc, newline="")
                 df = pd.read_csv(tio, dtype=str, engine="python", sep=None, on_bad_lines="skip", header=None)
             if df is not None and not df.empty:
-                try:
-                    cols = list(df.columns)
-                    pref = [c for c in cols if str(c).upper()=="LNAME"] or [c for c in cols if "名称" in str(c)] or cols
-                    score = _series_cjk_ratio(df[pref[0]])
-                except Exception:
-                    try:
-                        sample = df.head(200).astype(str).fillna("").agg("|".join, axis=1).str.cat(sep="")
-                        score = _cjk_ratio(sample)
-                    except Exception:
-                        score = 0.0
+                score = _df_encoding_score(df)
                 if score > best_score:
                     best_score = score
                     best_df = df
@@ -98,43 +115,46 @@ def try_parse_csv(path: str, header="auto"):  # r6: encoding auto-score + mojiba
     if last_err: raise last_err
     return pd.DataFrame()
 
-def try_parse_txt(path: str):
+def try_parse_txt(path: str, *, force_encoding: str = None):
     from io import StringIO
     data = Path(path).read_bytes()
-    for enc in COMMON_ENCODINGS:
+    encodings = [force_encoding] if force_encoding else COMMON_ENCODINGS
+    for enc in encodings:
         try:
             s = data.decode(enc)
         except Exception:
             continue
-        s = s.replace("\r\n","\n").replace("\r","\n")
-        if s and s[0] == "\ufeff": s = s[1:]
+        s = s.replace("\\r\\n","\\n").replace("\\r","\\n")
+        if s and s[0] == "\\ufeff": s = s[1:]
         try: delim = sniff_delimiter(s)
         except Exception: delim = None
         def _read(sep):
             sio = StringIO(s)
             return pd.read_csv(sio, sep=sep, header=None, dtype=str, engine="python",
-                               quoting=3, on_bad_lines="skip", escapechar="\\").dropna(axis=1, how="all").dropna(axis=0, how="all")
-        for sep in [delim, "|","\t",",",";","\s+"]:
+                               quoting=3, on_bad_lines="skip", escapechar="\\\\").dropna(axis=1, how="all").dropna(axis=0, how="all")
+        df = None
+        for sep in [delim, "|","\\t",",",";","\\s+"]:
             if not sep: continue
             try:
-                df = _read(sep)
-                if df is not None and not df.empty: break
+                t = _read(sep)
+                if t is not None and not t.empty:
+                    df = t; break
             except Exception:
-                df = None
-        else:
-            df = None
+                pass
+        if df is None: continue
         if df is not None and df.shape[1] == 1:
             col = df.columns[0]
-            for sep in ["|","\t",",",";"]:
+            for sep in ["|","\\t",",",";"]:
                 parts = df[col].str.split(sep, expand=True)
                 if parts.shape[1] >= 2: df = parts; break
             else:
-                parts = df[col].str.split(r"\s+", expand=True)
+                parts = df[col].str.split(r"\\s+", expand=True)
                 if parts.shape[1] >= 2: df = parts
-        if df is not None and not df.empty: return df
+        if df is not None and not df.empty:
+            return df
     raise RuntimeError("无法解析 TXT：请另存为 CSV/Excel 再导入。")
 
-def read_any(path: str, header="auto"):
+def read_any(path: str, header="auto", *, force_encoding: str = None):
     p = Path(path); ext = p.suffix.lower()
     def _maybe(loader):
         if header != "auto": return loader(header)
@@ -153,9 +173,9 @@ def read_any(path: str, header="auto"):
             raise RuntimeError("读取 .xls 需要 xlrd==1.2.0，请另存为 .xlsx/CSV。")
         return _maybe(lambda h: pd.read_excel(path, engine="xlrd", dtype=str, header=h))
     if ext == ".csv":
-        return try_parse_csv(path, header=header)
+        return try_parse_csv(path, header=header, force_encoding=force_encoding)
     if ext in [".txt",".dat"]:
-        return try_parse_txt(path)
+        return try_parse_txt(path, force_encoding=force_encoding)
     raise RuntimeError("不支持的文件类型，请转存为 CSV/Excel 后再导入。")
 
 def export_text_xlsx(df: pd.DataFrame, path: str, *, include_header: bool = True):
@@ -173,7 +193,6 @@ def export_text_xlsx(df: pd.DataFrame, path: str, *, include_header: bool = True
     wb.save(path)
 
 def _apply_bg_to_tree(tree: ttk.Treeview, img_path: str, opacity: float = 0.08):
-    import hashlib
     key = f"TVBG_{hashlib.md5(str(id(tree)).encode()).hexdigest()[:8]}"
     tree._bg_style_name = key + ".Treeview"
     tree._bg_field_name = key + ".field"
@@ -206,6 +225,13 @@ class ScrollableTree(ttk.Frame):
     def __init__(self, master, **kwargs):
         super().__init__(master)
         self.tree = ttk.Treeview(self, show="headings", **kwargs)
+        # 占位列，确保空表时也能绘制背景
+        try:
+            self.tree["columns"] = ["__dummy__"]
+            self.tree.column("__dummy__", width=0, stretch=False)
+            self.tree.heading("__dummy__", text="")
+        except Exception:
+            pass
         xbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
         ybar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(xscrollcommand=xbar.set, yscrollcommand=ybar.set)
@@ -272,9 +298,9 @@ def pick_ibps(df):
         use = df2[[code_col, name_col]].copy(); use.columns = ["code","name"]
     else:
         use = df2.iloc[:, :2].copy(); use.columns = ["code","name"]
-    use["code"] = use["code"].astype(str).str.replace(r"\.0$", "", regex=True)
-    use["code"] = use["code"].str.extract(r"(\d{12})", expand=False).fillna("")
-    use["name"] = use["name"].astype(str).map(fix_mojibake).str.replace("\u3000"," ").str.strip()
+    use["code"] = use["code"].astype(str).str.replace(r"\\.0$", "", regex=True)
+    use["code"] = use["code"].str.extract(r"(\\d{12})", expand=False).fillna("")
+    use["name"] = use["name"].astype(str).map(fix_mojibake).str.replace("\\u3000"," ").str.strip()
     use = use[(use["code"]!="") & (use["name"]!="")].drop_duplicates(subset=["code"]).reset_index(drop=True)
     return use
 
@@ -293,24 +319,24 @@ def pick_cnaps(df):
             use["LNAME"] = use["LNAME"].str.strip()
     elif df2.shape[1] == 1:
         col = df2.columns[0]
-        parts = df2[col].str.split(r"[|\t,;]+", expand=True)
+        parts = df2[col].str.split(r"[|\\t,;]+", expand=True)
         if parts.shape[1] >= 4:
             use = parts.iloc[:, :4]; use.columns = needed
         else:
-            parts = df2[col].str.split(r"\s+", expand=True)
+            parts = df2[col].str.split(r"\\s+", expand=True)
             if parts.shape[1] >= 4:
                 use = parts.iloc[:, :4]; use.columns = needed
             else:
                 def regex_extract(s):
                     s = str(s or "")
-                    m = re.search(r"(\d{12})", s)
+                    m = re.search(r"(\\d{12})", s)
                     tail = (s[m.end():].strip() if m else "")
-                    return (m.group(1) if m else ""), "", "", tail.strip(" ,;|\t")
+                    return (m.group(1) if m else ""), "", "", tail.strip(" ,;|\\t")
                 use = pd.DataFrame([regex_extract(v) for v in df2[col].tolist()], columns=needed)
     else:
         use = df2.reindex(columns=range(4)).copy(); use.columns = needed
     use["BNKCODE"] = use["BNKCODE"].astype(str).str.replace(".0","", regex=False)
-    use["BNKCODE"] = use["BNKCODE"].str.extract(r"(\d{12})", expand=False).fillna("")
+    use["BNKCODE"] = use["BNKCODE"].str.extract(r"(\\d{12})", expand=False).fillna("")
     use["LNAME"] = use["LNAME"].astype(str).map(fix_mojibake).str.strip()
     use = use[(use["BNKCODE"]!="") & (use["LNAME"]!="")].drop_duplicates(subset=["BNKCODE"]).reset_index(drop=True)
     return use
@@ -366,6 +392,11 @@ class LibraryTab(ttk.Frame):
         ttk.Label(top, text="维护库：").pack(side="left")
         ttk.Radiobutton(top, text="IBPS（清算）", variable=self.table_choice, value="ibps").pack(side="left")
         ttk.Radiobutton(top, text="CNAPS（大额）", variable=self.table_choice, value="cnaps").pack(side="left", padx=8)
+        self.enc = tk.StringVar(value="自动")
+        ttk.Label(top, text="编码：").pack(side="left", padx=(10,2))
+        self.enc_cbx = ttk.Combobox(top, textvariable=self.enc, state="readonly",
+                                    values=["自动","UTF-8","GBK","GB18030","UTF-16","Latin1","BIG5-HKSCS","BIG5","CP950"], width=12)
+        self.enc_cbx.pack(side="left")
         ttk.Button(top, text="导入行号", command=self.import_file).pack(side="left", padx=12)
         ttk.Button(top, text="导出库", command=self.export_db).pack(side="left", padx=12)
         ttk.Label(top, text="关键词：").pack(side="left", padx=12)
@@ -376,14 +407,15 @@ class LibraryTab(ttk.Frame):
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("TXT/Excel/CSV","*.txt;*.dat;*.xls;*.xlsx;*.csv"),("所有文件","*.*")])
         if not path: return
-        try: df = read_any(path, header="auto")
+        enc_map = {"自动": None, "UTF-8":"utf-8","GBK":"gbk","GB18030":"gb18030","UTF-16":"utf-16","Latin1":"latin1","BIG5-HKSCS":"big5hkscs","BIG5":"big5","CP950":"cp950"}
+        try: df = read_any(path, header="auto", force_encoding=enc_map.get(self.enc.get(), None))
         except Exception as e: messagebox.showerror("失败", f"读取失败：{e}"); return
         rows = []; raw_src = os.path.basename(path)
         if self.table_choice.get()=="cnaps":
             use = pick_cnaps(df)
             for _, r in use.iterrows():
                 code = r.get("BNKCODE",""); name = r.get("LNAME","")
-                if re.fullmatch(r"\d{12}", str(code) or ""):
+                if re.fullmatch(r"\\d{12}", str(code) or ""):
                     raw = "|".join([str(r.get(c,"")) for c in ["BNKCODE","CLSCODE","CITYCODE","LNAME"]])
                     rows.append((str(code), str(name), raw, raw_src))
             table="cnaps"
@@ -391,7 +423,7 @@ class LibraryTab(ttk.Frame):
             use = pick_ibps(df)
             for _, r in use.iterrows():
                 code = r.get("code",""); name = r.get("name","")
-                if re.fullmatch(r"\d{12}", str(code) or ""):
+                if re.fullmatch(r"\\d{12}", str(code) or ""):
                     raw = "|".join([str(r.get(c,"")) for c in ["code","name"]])
                     rows.append((str(code), str(name), raw, raw_src))
             table="ibps"
@@ -464,7 +496,7 @@ class PayrollDialog(tk.Toplevel):
         vals = {k: v.get().strip() for k, v in self.vars.items()}
         probs = []
         if not vals["收款人银行名称"]: probs.append("收款人银行名称 不能为空")
-        if not re.fullmatch(r"\d{6,32}", vals["收款人卡号"]): probs.append("收款人卡号 必须为6-32位数字")
+        if not re.fullmatch(r"\\d{6,32}", vals["收款人卡号"]): probs.append("收款人卡号 必须为6-32位数字")
         try:
             if float(vals["金额"]) <= 0: probs.append("金额 必须大于0")
         except Exception:
@@ -500,22 +532,22 @@ class PayrollTab(ttk.Frame):
         if not path: return
         try: df = read_any(path, header="auto")
         except Exception as e: messagebox.showerror("失败", f"读取失败：{e}"); return
-        cols = [str(c).strip().replace("\ufeff","") for c in list(df.columns)]
+        cols = [str(c).strip().replace("\\ufeff","") for c in list(df.columns)]
         if set(self.COLS).issubset(set(cols)): df = df[self.COLS].copy()
         else: df = df.iloc[:, :4].copy(); df.columns = self.COLS
-        def _strip(s): return "" if pd.isna(s) else str(s).replace("\u3000"," ").strip()
+        def _strip(s): return "" if pd.isna(s) else str(s).replace("\\u3000"," ").strip()
         for c in self.COLS: df[c] = df[c].map(_strip)
         df = df[~(df[self.COLS].apply(lambda r: all(x=="" for x in r), axis=1))].reset_index(drop=True)
         bad_rows = []
         for idx, r in df.iterrows():
             ok = True
-            if r["收款人银行名称"] == "": ok = False
-            if not re.fullmatch(r"\d{6,32}", r["收款人卡号"]): ok = False
+            if not r["收款人银行名称"]: ok = False
+            if not re.fullmatch(r"\\d{6,32}", r["收款人卡号"]): ok = False
             try:
                 if float(r["金额"]) <= 0: ok = False
             except Exception:
                 ok = False
-            if r["收款人名称"] == "": ok = False
+            if not r["收款人名称"]: ok = False
             if not ok: bad_rows.append(idx)
         if bad_rows: df = df.drop(index=bad_rows).reset_index(drop=True)
         self.df = df; self._reload()
@@ -543,7 +575,7 @@ class PayrollTab(ttk.Frame):
         df = self.df.fillna("")
         probs = []
         if df["收款人银行名称"].str.strip().eq("").any(): probs.append("存在 银行名称 为空的记录")
-        if (~df["收款人卡号"].astype(str).str.match(r"^\d{6,32}$", na=False)).any(): probs.append("存在 卡号 非6-32位数字")
+        if (~df["收款人卡号"].astype(str).str.match(r"^\\d{6,32}$", na=False)).any(): probs.append("存在 卡号 非6-32位数字")
         try:
             if (pd.to_numeric(df["金额"], errors="coerce")<=0).any(): probs.append("存在 金额≤0 或非数字")
         except Exception: probs.append("金额列解析异常")
@@ -633,7 +665,7 @@ class TransferDialog(tk.Toplevel):
             v[k]=val
         probs=[]
         if not v["收款方户名"]: probs.append("收款方户名 不能为空")
-        if not re.fullmatch(r"\d{6,32}", v["收款方账号"]): probs.append("收款方账号 必须为6-32位数字")
+        if not re.fullmatch(r"\\d{6,32}", v["收款方账号"]): probs.append("收款方账号 必须为6-32位数字")
         try:
             if float(v["金额"]) <= 0: probs.append("金额 必须大于0")
         except Exception:
@@ -692,7 +724,7 @@ class TransferTab(ttk.Frame):
             df = df.iloc[:, :9]; df.columns = need
         errors = []
         for idx, r in df.fillna("").iterrows():
-            if not re.fullmatch(r"\d{6,32}", str(r["收款方账号"])): errors.append(f"第{idx+1}行：收款方账号 非6-32位数字")
+            if not re.fullmatch(r"^\\d{6,32}$", str(r["收款方账号"])): errors.append(f"第{idx+1}行：收款方账号 非6-32位数字")
             if str(r["收款方户名"]).strip()=="" : errors.append(f"第{idx+1}行：收款方户名 为空")
             try:
                 if float(str(r["金额"]))<=0: errors.append(f"第{idx+1}行：金额 ≤ 0")
@@ -705,13 +737,13 @@ class TransferTab(ttk.Frame):
             if mode=="1" and str(r["收款方银行大额支付行号/跨行清算行号"]).strip()=="":
                 errors.append(f"第{idx+1}行：跨行转账需提供行号")
         if errors:
-            messagebox.showerror("校验失败","导入中止：\n" + "\n".join(errors[:30]) + ("\n..." if len(errors)>30 else "")); return
+            messagebox.showerror("校验失败","导入中止：\\n" + "\\n".join(errors[:30]) + ("\\n..." if len(errors)>30 else "")); return
         self.df = df[self.COLS].astype(str); self._reload()
         messagebox.showinfo("成功", f"导入处理完成：有效 {len(self.df)} 行（共 {len(df)} 行）")
     def validate_export(self):
         df = self.df.fillna("")
         probs = []
-        if (~df["收款方账号"].astype(str).str.match(r"^\d{6,32}$", na=False)).any(): probs.append("收款方账号 格式异常")
+        if (~df["收款方账号"].astype(str).str.match(r"^\\d{6,32}$", na=False)).any(): probs.append("收款方账号 格式异常")
         if df["收款方户名"].str.strip().eq("").any(): probs.append("收款方户名 不能为空")
         try:
             if (pd.to_numeric(df["金额"], errors="coerce")<=0).any(): probs.append("金额 必须大于0")
@@ -775,8 +807,10 @@ def _repair_db_mojibake():
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("华夏离线批量编辑器 v2.3.6-r6")
+        self.title("华夏离线批量编辑器 v2.3.6-r6f")
         self.minsize(1200, 760)
+        self._bg_path = str(APP_DIR / "bg.jpg")
+        self._bg_opacity = 0.08
         try: self.iconbitmap(str(APP_DIR / "icon.ico"))
         except Exception: pass
         ensure_db(DB_PATH)
@@ -785,11 +819,14 @@ class App(tk.Tk):
         def _choose_bg():
             p = filedialog.askopenfilename(title='选择背景图片', filetypes=[('图片','*.jpg;*.jpeg;*.png;*.webp;*.bmp')])
             if not p: return
-            for tv in getattr(self, "_all_trees", []): _apply_bg_to_tree(tv, p, opacity=getattr(self, "_bg_opacity", 0.08))
+            self._bg_path = p
+            for tv in getattr(self, "_all_trees", []):
+                _apply_bg_to_tree(tv, self._bg_path, opacity=getattr(self, "_bg_opacity", 0.08))
         def _opacity(val=None):
             try: self._bg_opacity = float(val)
             except Exception: self._bg_opacity = 0.08
-            for tv in getattr(self, "_all_trees", []): _apply_bg_to_tree(tv, str(APP_DIR / "bg.jpg"), opacity=self._bg_opacity)
+            for tv in getattr(self, "_all_trees", []):
+                _apply_bg_to_tree(tv, self._bg_path, opacity=self._bg_opacity)
         viewm.add_command(label='设置背景图…', command=_choose_bg)
         viewm.add_separator()
         viewm.add_radiobutton(label='透明度 5%',  command=lambda: _opacity(0.05))
@@ -802,7 +839,7 @@ class App(tk.Tk):
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="环境自检与修复…", command=show_env_check)
         helpm.add_separator()
-        helpm.add_command(label="关于", command=lambda: messagebox.showinfo("关于","华夏离线批量编辑器 v2.3.6-r6"))
+        helpm.add_command(label="关于", command=lambda: messagebox.showinfo("关于","华夏离线批量编辑器 v2.3.6-r6f"))
         menubar.add_cascade(label="帮助", menu=helpm)
         self.config(menu=menubar)
         nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
@@ -811,6 +848,9 @@ class App(tk.Tk):
         nb.add(t2, text="代发工资录入")
         nb.add(t3, text="批量转账录入")
         self._all_trees = [t1.stree.tree, t2.stree.tree, t3.stree.tree]
+        for tv in self._all_trees:
+            try: _apply_bg_to_tree(tv, self._bg_path, opacity=self._bg_opacity)
+            except Exception: pass
 
 if __name__ == "__main__":
     App().mainloop()

@@ -1,5 +1,5 @@
 
-name: Build Windows EXE (v2.3.6-r6)
+name: Build Windows EXE (v2.3.6-r6f)
 
 on:
   push:
@@ -18,17 +18,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pyinstaller app_exact.spec
-          if (Test-Path "${{ github.workspace }}\build_exe.py") {
-            python "${{ github.workspace }}\build_exe.py" --onefile
-          } else {
-            Write-Host "build_exe.py not found; skip onefile"
-          }
+          python build_exe.py --onefile
       - uses: actions/upload-artifact@v4
         with:
-          name: hx-offline-editor-dist-v2_3_6_r6
+          name: hx-offline-editor-dist-v2_3_6_r6f
           path: dist/**
       - uses: actions/upload-artifact@v4
         with:
-          name: hx-offline-editor-exe-onefile-v2_3_6_r6
+          name: hx-offline-editor-exe-onefile-v2_3_6_r6f
           path: dist/*.exe
           if-no-files-found: ignore
