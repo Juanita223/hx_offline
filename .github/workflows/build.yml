@@ -1,0 +1,31 @@
+
+name: Build Windows EXE (v2.3.6-r3-hf1)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller==6.10
+      - run: |
+          pyinstaller app_exact.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hx-offline-editor-dist-v2_3_6_r3_hf1
+          path: dist/**
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hx-offline-editor-exe-v2_3_6_r3_hf1
+          path: dist/*.exe
+          if-no-files-found: ignore
