@@ -1,1 +1,44 @@
-name: dummy
+name: Build Windows EXE (v2.3.6-r6g)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build (spec) - folder dist
+        run: |
+          pyinstaller app_exact.spec
+
+      - name: Build (onefile exe)
+        run: |
+          python build_exe.py --onefile
+
+      - name: Upload dist (folder)
+        uses: actions/upload-artifact@v4
+        with:
+          name: hx-offline-editor-dist-v2_3_6_r6g
+          path: dist/**
+
+      - name: Upload single exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hx-offline-editor-exe-onefile-v2_3_6_r6g
+          path: dist/*.exe
+          if-no-files-found: ignore
