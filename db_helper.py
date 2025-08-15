@@ -1,7 +1,7 @@
 
 import sqlite3
 from pathlib import Path
-from typing import Iterable, Tuple, List
+from typing import Iterable, Tuple
 
 def ensure_db(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -43,29 +43,19 @@ def upsert_many_batched(db_path: str, table: str, rows: Iterable[Tuple[str,str,s
     for r in rows:
         batch.append(r)
         if len(batch) >= batch_size:
-            cur.executemany(sql, batch)
-            conn.commit()
-            count += len(batch)
-            batch.clear()
+            cur.executemany(sql, batch); conn.commit(); count += len(batch); batch.clear()
     if batch:
-        cur.executemany(sql, batch)
-        conn.commit()
-        count += len(batch)
-    conn.close()
-    return count
+        cur.executemany(sql, batch); conn.commit(); count += len(batch)
+    conn.close(); return count
 
-def replace_all(db_path: str, table: str, rows: List[Tuple[str,str,str,str]]):
+def replace_all(db_path: str, table: str, rows):
     conn = sqlite3.connect(db_path); cur = conn.cursor()
-    cur.execute(f"DELETE FROM {table}")
-    conn.commit(); conn.close()
+    cur.execute(f"DELETE FROM {table}"); conn.commit(); conn.close()
     upsert_many_batched(db_path, table, rows)
 
 def query(db_path: str, table: str, keyword: str, limit: int = 1000):
     conn = sqlite3.connect(db_path); conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    kw = f"%{keyword}%"
+    cur = conn.cursor(); kw = f"%{keyword}%"
     cur.execute(f"SELECT code, name FROM {table} WHERE code LIKE ? OR name LIKE ? ORDER BY name LIMIT ?",
                 (kw, kw, limit))
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return rows
+    rows = [dict(r) for r in cur.fetchall()]; conn.close(); return rows

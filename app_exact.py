@@ -1,15 +1,15 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import pandas as pd
 from pathlib import Path
+import pandas as pd
 import os, re, csv, zipfile, importlib
+
 from PIL import Image, ImageTk
 
-# engines
-try: import openpyxl   # noqa
+try: import openpyxl  # noqa
 except Exception: openpyxl = None
-try: import xlrd       # noqa
+try: import xlrd      # noqa
 except Exception: xlrd = None
 
 from db_helper import ensure_db, upsert_many_batched, replace_all, query
@@ -19,6 +19,36 @@ DB_PATH = str(APP_DIR / "codebook.db")
 
 COMMON_ENCODINGS = ["utf-8-sig","utf-8","gbk","gb18030","utf-16","utf-16le","utf-16be","latin1"]
 COMMON_DELIMS = ["|","\t",",",";"," "]
+
+def _cjk_ratio(text: str) -> float:
+    if not text: return 0.0
+    total = len(text)
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    return cjk / max(1, total)
+
+def _series_cjk_ratio(ser) -> float:
+    try:
+        import pandas as _pd
+        s = _pd.Series(ser).astype(str).dropna()
+        sample = "".join(s.head(10000).tolist())
+        return _cjk_ratio(sample)
+    except Exception:
+        return 0.0
+
+def fix_mojibake(s: str) -> str:
+    if s is None: return s
+    s0 = str(s)
+    cands = [s0]
+    pairs = [("latin1","utf-8"),("latin1","gbk"),("gbk","utf-8"),("utf-8","gbk")]
+    for frm, to in pairs:
+        try:
+            cands.append(s0.encode(frm, errors="ignore").decode(to, errors="ignore"))
+        except Exception:
+            pass
+    best = max(cands, key=_cjk_ratio)
+    if _cjk_ratio(best) - _cjk_ratio(s0) >= 0.15:
+        return best
+    return s0
 
 def sniff_delimiter(text: str):
     try:
@@ -33,14 +63,14 @@ def sniff_delimiter(text: str):
                 best, bestn = d, n
         return best or ","
 
-def try_parse_csv(path: str, header="auto"):
-    """稳健 CSV：多编码兜底 + 自动表头回退"""
+def try_parse_csv(path: str, header="auto"):  # r6: encoding auto-score + mojibake safe
     from io import TextIOWrapper, BytesIO
     data = Path(path).read_bytes()
     last_err = None
+    best_df = None
+    best_score = -1.0
     for enc in COMMON_ENCODINGS:
         try:
-            # header=0
             bio = BytesIO(data); tio = TextIOWrapper(bio, encoding=enc, newline="")
             df = pd.read_csv(tio, dtype=str, engine="python", sep=None, on_bad_lines="skip", header=0)
             empty = (df is None) or (getattr(df, "empty", False)) or (len(df)==0)
@@ -48,16 +78,27 @@ def try_parse_csv(path: str, header="auto"):
                 bio = BytesIO(data); tio = TextIOWrapper(bio, encoding=enc, newline="")
                 df = pd.read_csv(tio, dtype=str, engine="python", sep=None, on_bad_lines="skip", header=None)
             if df is not None and not df.empty:
-                return df
+                try:
+                    cols = list(df.columns)
+                    pref = [c for c in cols if str(c).upper()=="LNAME"] or [c for c in cols if "名称" in str(c)] or cols
+                    score = _series_cjk_ratio(df[pref[0]])
+                except Exception:
+                    try:
+                        sample = df.head(200).astype(str).fillna("").agg("|".join, axis=1).str.cat(sep="")
+                        score = _cjk_ratio(sample)
+                    except Exception:
+                        score = 0.0
+                if score > best_score:
+                    best_score = score
+                    best_df = df
         except Exception as e:
-            last_err = e
-            continue
-    if last_err:
-        raise last_err
+            last_err = e; continue
+    if best_df is not None:
+        return best_df
+    if last_err: raise last_err
     return pd.DataFrame()
 
 def try_parse_txt(path: str):
-    """智能 TXT：多编码 + 分隔符嗅探 + 宽松解析"""
     from io import StringIO
     data = Path(path).read_bytes()
     for enc in COMMON_ENCODINGS:
@@ -94,25 +135,23 @@ def try_parse_txt(path: str):
     raise RuntimeError("无法解析 TXT：请另存为 CSV/Excel 再导入。")
 
 def read_any(path: str, header="auto"):
-    """统一入口：header='auto' 先表头再无表头回退"""
     p = Path(path); ext = p.suffix.lower()
-    def _maybe_fallback(df_loader):
-        if header != "auto":
-            return df_loader(header)
-        df = df_loader(0)
+    def _maybe(loader):
+        if header != "auto": return loader(header)
+        df = loader(0)
         empty = (df is None) or (getattr(df, "empty", False)) or (len(df)==0)
         if empty:
-            try: return df_loader(None)
+            try: return loader(None)
             except Exception: return df
         return df
     if ext in [".xlsx",".xlsm",".xltx",".xltm"]:
         if not zipfile.is_zipfile(path):
             raise RuntimeError("扩展名为 .xlsx，但内容不是 Office Open XML（可能被误改名）。请另存为 .xlsx 再试。")
-        return _maybe_fallback(lambda h: pd.read_excel(path, engine="openpyxl", dtype=str, header=h))
+        return _maybe(lambda h: pd.read_excel(path, engine="openpyxl", dtype=str, header=h))
     if ext == ".xls":
         if xlrd is None or getattr(importlib.import_module('xlrd'), '__version__', '') != '1.2.0':
-            raise RuntimeError("读取 .xls 需要 xlrd==1.2.0，请在“帮助→环境自检与修复”查看修复指引，或另存为 .xlsx/CSV。")
-        return _maybe_fallback(lambda h: pd.read_excel(path, engine="xlrd", dtype=str, header=h))
+            raise RuntimeError("读取 .xls 需要 xlrd==1.2.0，请另存为 .xlsx/CSV。")
+        return _maybe(lambda h: pd.read_excel(path, engine="xlrd", dtype=str, header=h))
     if ext == ".csv":
         return try_parse_csv(path, header=header)
     if ext in [".txt",".dat"]:
@@ -122,21 +161,18 @@ def read_any(path: str, header="auto"):
 def export_text_xlsx(df: pd.DataFrame, path: str, *, include_header: bool = True):
     from openpyxl import Workbook
     wb = Workbook(); ws = wb.active; ws.title="Sheet1"
-    start_row = 1
+    start = 1
     if include_header:
-        for j, col in enumerate(df.columns, start=1):
-            cell = ws.cell(row=1, column=j, value=str(col)); cell.number_format="@"
-        start_row = 2
-    for i, (_, row) in enumerate(df.iterrows(), start=start_row):
-        for j, col in enumerate(df.columns, start=1):
+        for j,col in enumerate(df.columns, start=1):
+            cell = ws.cell(row=1,column=j,value=str(col)); cell.number_format="@"
+        start = 2
+    for i,(_,row) in enumerate(df.iterrows(), start=start):
+        for j,col in enumerate(df.columns, start=1):
             val = "" if pd.isna(row[col]) else str(row[col])
             cell = ws.cell(row=i, column=j, value=val); cell.number_format="@"
     wb.save(path)
 
-# ---- 背景：Treeview 直接底纹可见 ----
 def _apply_bg_to_tree(tree: ttk.Treeview, img_path: str, opacity: float = 0.08):
-    """通过 ttk.Style 把图片作为 Treeview 的 field 背景，并随尺寸自适应重绘"""
-    from PIL import Image, ImageTk
     import hashlib
     key = f"TVBG_{hashlib.md5(str(id(tree)).encode()).hexdigest()[:8]}"
     tree._bg_style_name = key + ".Treeview"
@@ -150,27 +186,22 @@ def _apply_bg_to_tree(tree: ttk.Treeview, img_path: str, opacity: float = 0.08):
             pil = Image.open(img_path).convert("RGBA")
             scale = max(w / max(1,pil.width), h / max(1,pil.height))
             im = pil.resize((int(pil.width*scale), int(pil.height*scale)), Image.LANCZOS)
-            left = max(0, (im.width - w) // 2); top = max(0, (im.height - h) // 2)
-            im = im.crop((left, top, left + w, top + h))
+            left = max(0, (im.width - w)//2); top = max(0, (im.height - h)//2)
+            im = im.crop((left, top, left+w, top+h))
             fg = im.copy(); fg.putalpha(int(255*opacity))
             bg = Image.new("RGBA", im.size, (255,255,255,255))
             im = Image.alpha_composite(bg, fg).convert("RGB")
             tree._bg_imgtk = ImageTk.PhotoImage(im)
-            try:
-                style.element_create(tree._bg_field_name, "image", tree._bg_imgtk, border=0, sticky="nswe")
-            except Exception:
-                pass
+            try: style.element_create(tree._bg_field_name, "image", tree._bg_imgtk, border=0, sticky="nswe")
+            except Exception: pass
             style.layout(tree._bg_style_name, [
-                (tree._bg_field_name, {"children":[
-                    ("Treeview.padding", {"children":[("Treeview.treearea", {"sticky":"nswe"})], "sticky":"nswe"})
-                ], "sticky":"nswe"})
+                (tree._bg_field_name, {"children":[("Treeview.padding", {"children":[("Treeview.treearea", {"sticky":"nswe"})], "sticky":"nswe"})], "sticky":"nswe"})
             ])
             tree.configure(style=tree._bg_style_name)
         except Exception:
             pass
     tree.bind("<Configure>", _render, add="+"); tree.after(100, _render)
 
-# 容器控件
 class ScrollableTree(ttk.Frame):
     def __init__(self, master, **kwargs):
         super().__init__(master)
@@ -181,8 +212,7 @@ class ScrollableTree(ttk.Frame):
         self.tree.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1); self.grid_columnconfigure(0, weight=1)
 
 class ScrollableForm(ttk.Frame):
     def __init__(self, master):
@@ -192,30 +222,26 @@ class ScrollableForm(ttk.Frame):
         vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
         self.inner = ttk.Frame(canvas)
         self.inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.create_window((0,0), window=self.inner, anchor="nw")
         canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         canvas.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1); self.grid_columnconfigure(0, weight=1)
 
 def center_and_autosize(win, min_w=760, min_h=420, pad=24):
     win.update_idletasks()
-    req_w = max(min_w, win.winfo_reqwidth() + pad)
-    req_h = max(min_h, win.winfo_reqheight() + pad)
+    req_w = max(min_w, win.winfo_reqwidth()+pad)
+    req_h = max(min_h, win.winfo_reqheight()+pad)
     try:
         parent = win.master.winfo_toplevel()
         px, py = parent.winfo_rootx(), parent.winfo_rooty()
         pw, ph = parent.winfo_width(), parent.winfo_height()
-        x = px + max(0, (pw - req_w)//2)
-        y = py + max(0, (ph - req_h)//2)
+        x = px + max(0, (pw - req_w)//2); y = py + max(0, (ph - req_h)//2)
     except Exception:
         x, y = 100, 100
-    win.minsize(req_w, req_h)
-    win.geometry(f"{req_w}x{req_h}+{x}+{y}")
+    win.minsize(req_w, req_h); win.geometry(f"{req_w}x{req_h}+{x}+{y}")
 
-# 数据抽取
 def _locate_header_row_for_ibps(df):
     scan = df.head(30).astype(str).fillna("")
     k_code = ["清算行行号","清算行号","联行号","行号","行号代码","清算行行号代码"]
@@ -248,7 +274,7 @@ def pick_ibps(df):
         use = df2.iloc[:, :2].copy(); use.columns = ["code","name"]
     use["code"] = use["code"].astype(str).str.replace(r"\.0$", "", regex=True)
     use["code"] = use["code"].str.extract(r"(\d{12})", expand=False).fillna("")
-    use["name"] = use["name"].astype(str).str.replace("\u3000"," ").str.strip()
+    use["name"] = use["name"].astype(str).map(fix_mojibake).str.replace("\u3000"," ").str.strip()
     use = use[(use["code"]!="") & (use["name"]!="")].drop_duplicates(subset=["code"]).reset_index(drop=True)
     return use
 
@@ -285,11 +311,10 @@ def pick_cnaps(df):
         use = df2.reindex(columns=range(4)).copy(); use.columns = needed
     use["BNKCODE"] = use["BNKCODE"].astype(str).str.replace(".0","", regex=False)
     use["BNKCODE"] = use["BNKCODE"].str.extract(r"(\d{12})", expand=False).fillna("")
-    use["LNAME"] = use["LNAME"].astype(str).str.strip()
+    use["LNAME"] = use["LNAME"].astype(str).map(fix_mojibake).str.strip()
     use = use[(use["BNKCODE"]!="") & (use["LNAME"]!="")].drop_duplicates(subset=["BNKCODE"]).reset_index(drop=True)
     return use
 
-# 选择框
 class CodePicker(tk.Toplevel):
     def __init__(self, master, default_source="ibps", ibps_only=False):
         super().__init__(master)
@@ -311,39 +336,31 @@ class CodePicker(tk.Toplevel):
         ttk.Label(top, text="关键字：").pack(side="left", padx=8)
         ent = ttk.Entry(top, textvariable=self.kw, width=32); ent.pack(side="left"); ent.bind("<Return>", lambda e: self.search())
         ttk.Button(top, text="查询", command=self.search).pack(side="left", padx=6)
-
         self.stree = ScrollableTree(self, height=18); self.stree.pack(fill="both", expand=True, padx=8, pady=6)
         tree = self.stree.tree; tree["columns"] = ["code","name"]
         for c, w in [("code",180),("name",480)]:
             tree.heading(c, text=c); tree.column(c, width=w, anchor="w")
         tree.bind("<Double-1>", lambda e: self.pick()); tree.bind("<Return>", lambda e: self.pick())
-
         btns = ttk.Frame(self, padding=8); btns.pack(fill="x")
         ttk.Button(btns, text="确定", command=self.pick).pack(side="right", padx=6)
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
-
         self.after(10, lambda: (self.search(), center_and_autosize(self, 760, 520)))
-
     def search(self):
         rows = query(DB_PATH, self.source.get(), self.kw.get().strip(), limit=5000)
-        tree = self.stree.tree; tree.delete(*tree.get_children())
-        for r in rows: tree.insert("", "end", values=[r["code"], r["name"]])
-
+        t = self.stree.tree; t.delete(*t.get_children())
+        for r in rows: t.insert("", "end", values=[r["code"], r["name"]])
     def pick(self):
-        tree = self.stree.tree; sel = tree.selection()
+        t = self.stree.tree; sel = t.selection()
         if not sel: messagebox.showinfo("提示","请先选择一条"); return
-        vals = tree.item(sel[0], "values")
-        self.selected_row = (vals[0], vals[1])
-        self.destroy()
+        vals = t.item(sel[0], "values")
+        self.selected_row = (vals[0], vals[1]); self.destroy()
 
-# 库维护
 class LibraryTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.table_choice = tk.StringVar(value="ibps")
         self.kw = tk.StringVar()
         self._build()
-
     def _build(self):
         top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=8)
         ttk.Label(top, text="维护库：").pack(side="left")
@@ -354,16 +371,13 @@ class LibraryTab(ttk.Frame):
         ttk.Label(top, text="关键词：").pack(side="left", padx=12)
         ttk.Entry(top, textvariable=self.kw, width=28).pack(side="left")
         ttk.Button(top, text="查询", command=self.search).pack(side="left", padx=6)
-
         self.stree = ScrollableTree(self); self.stree.pack(fill="both", expand=True, padx=8, pady=6)
         _apply_bg_to_tree(self.stree.tree, str(APP_DIR / "bg.jpg"), opacity=0.08)
-
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("TXT/Excel/CSV","*.txt;*.dat;*.xls;*.xlsx;*.csv"),("所有文件","*.*")])
         if not path: return
         try: df = read_any(path, header="auto")
-        except Exception as e:
-            messagebox.showerror("失败", f"读取失败：{e}"); return
+        except Exception as e: messagebox.showerror("失败", f"读取失败：{e}"); return
         rows = []; raw_src = os.path.basename(path)
         if self.table_choice.get()=="cnaps":
             use = pick_cnaps(df)
@@ -388,19 +402,15 @@ class LibraryTab(ttk.Frame):
         else:
             upsert_many_batched(DB_PATH, table, rows, batch_size=20000)
         messagebox.showinfo("成功", f"导入完成：共 {len(rows)} 条")
-        self.search()  # 导入后自动刷新
-
+        self.search()
     def search(self):
-        table = self.table_choice.get()
-        rows = query(DB_PATH, table, self.kw.get().strip(), limit=5000)
+        rows = query(DB_PATH, self.table_choice.get(), self.kw.get().strip(), limit=5000)
         import pandas as pd
         df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["code","name"])
         self._load_df(df)
-
     def export_db(self):
         rows = query(DB_PATH, self.table_choice.get(), "", limit=999999)
-        if not rows:
-            messagebox.showinfo("提示","当前库为空"); return
+        if not rows: messagebox.showinfo("提示","当前库为空"); return
         import pandas as pd
         df = pd.DataFrame(rows)
         path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel",".xlsx"),("CSV",".csv")])
@@ -413,23 +423,14 @@ class LibraryTab(ttk.Frame):
             messagebox.showinfo("成功", f"已导出：{os.path.basename(path)}")
         except Exception as e:
             messagebox.showerror("失败", f"导出失败：{e}")
-
     def _load_df(self, df):
-        tree = self.stree.tree
-        tree["columns"] = list(df.columns)
+        tree = self.stree.tree; tree["columns"]=list(df.columns)
         for col in df.columns:
-            tree.heading(col, text=col)
-            tree.column(col, width=220 if col=="name" else 160, anchor="w")
+            tree.heading(col, text=col); tree.column(col, width=220 if col=="name" else 160, anchor="w")
         tree.delete(*tree.get_children())
-        batch = []
         for _, row in df.iterrows():
-            batch.append([str(row.get(c,"")) for c in df.columns])
-            if len(batch) >= 2000:
-                for vals in batch: tree.insert("", "end", values=vals)
-                batch.clear(); tree.update_idletasks()
-        for vals in batch: tree.insert("", "end", values=vals)
+            tree.insert("", "end", values=[str(row.get(c,"")) for c in df.columns])
 
-# 代发工资
 class PayrollDialog(tk.Toplevel):
     COLS = ["收款人银行名称","收款人卡号","收款人名称","金额"]
     def __init__(self, master, init_values=None):
@@ -469,16 +470,13 @@ class PayrollDialog(tk.Toplevel):
         except Exception:
             probs.append("金额 不是有效数字")
         if not vals["收款人名称"]: probs.append("收款人名称 不能为空")
-        if probs:
-            messagebox.showwarning("校验不通过","；".join(probs)); return
+        if probs: messagebox.showwarning("校验不通过","；".join(probs)); return
         self.values = vals; self.destroy()
 
 class PayrollTab(ttk.Frame):
     COLS = ["收款人银行名称","收款人卡号","收款人名称","金额"]
     def __init__(self, master):
-        super().__init__(master)
-        self.df = pd.DataFrame(columns=self.COLS)
-        self._build()
+        super().__init__(master); self.df = pd.DataFrame(columns=self.COLS); self._build()
     def _build(self):
         top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=8)
         ttk.Button(top, text="新增", command=self.add_one).pack(side="left")
@@ -490,19 +488,18 @@ class PayrollTab(ttk.Frame):
         _apply_bg_to_tree(self.stree.tree, str(APP_DIR / "bg.jpg"), opacity=0.08)
         self._reload()
     def _reload(self):
-        tree = self.stree.tree; df = self.df.fillna("")
-        tree["columns"] = list(self.COLS)
+        t = self.stree.tree; df=self.df.fillna("")
+        t["columns"]=list(self.COLS)
         for col in self.COLS:
-            tree.heading(col, text=col); tree.column(col, width=(240 if "银行名称" in col else 180), anchor="w")
-        tree.delete(*tree.get_children())
-        for _, row in df.iterrows():
-            tree.insert("", "end", values=[str(row.get(c,"")) for c in self.COLS])
+            t.heading(col, text=col); t.column(col, width=(240 if "银行名称" in col else 180), anchor="w")
+        t.delete(*t.get_children())
+        for _,row in df.iterrows():
+            t.insert("", "end", values=[str(row.get(c,"")) for c in self.COLS])
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel/CSV","*.xlsx;*.xls;*.csv"), ("所有文件","*.*")])
         if not path: return
         try: df = read_any(path, header="auto")
-        except Exception as e:
-            messagebox.showerror("失败", f"读取失败：{e}"); return
+        except Exception as e: messagebox.showerror("失败", f"读取失败：{e}"); return
         cols = [str(c).strip().replace("\ufeff","") for c in list(df.columns)]
         if set(self.COLS).issubset(set(cols)): df = df[self.COLS].copy()
         else: df = df.iloc[:, :4].copy(); df.columns = self.COLS
@@ -531,17 +528,17 @@ class PayrollTab(ttk.Frame):
         if getattr(dlg, "values", None):
             self.df.loc[len(self.df)] = [dlg.values.get(c,"") for c in self.COLS]; self._reload()
     def edit_one(self):
-        tree = self.stree.tree; sel = tree.selection()
+        t = self.stree.tree; sel = t.selection()
         if not sel: messagebox.showinfo("提示","请先选择一行"); return
-        idx = tree.index(sel[0]); init = {c: str(self.df.iloc[idx][c]) for c in self.COLS}
+        idx = t.index(sel[0]); init = {c: str(self.df.iloc[idx][c]) for c in self.COLS}
         dlg = PayrollDialog(self, init_values=init); self.wait_window(dlg)
         if getattr(dlg, "values", None):
             for c in self.COLS: self.df.at[self.df.index[idx], c] = dlg.values.get(c,"")
             self._reload()
     def delete_selected(self):
-        tree = self.stree.tree; sel = tree.selection()
+        t = self.stree.tree; sel = t.selection()
         if not sel: return
-        idx = tree.index(sel[0]); self.df = self.df.drop(self.df.index[idx]).reset_index(drop=True); self._reload()
+        idx = t.index(sel[0]); self.df = self.df.drop(self.df.index[idx]).reset_index(drop=True); self._reload()
     def validate_export(self):
         df = self.df.fillna("")
         probs = []
@@ -553,10 +550,8 @@ class PayrollTab(ttk.Frame):
         if probs: messagebox.showwarning("校验结果","；".join(probs))
         path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel",".xlsx")])
         if not path: return
-        export_text_xlsx(self.df, path, include_header=False)
-        messagebox.showinfo("成功","已导出（无表头，文本格式）")
+        export_text_xlsx(self.df, path, include_header=False); messagebox.showinfo("成功","已导出（无表头，文本格式）")
 
-# 批量转账
 class TransferDialog(tk.Toplevel):
     COLS = ["收款方账号","收款方户名","金额","转账方式","行别信息类型",
             "收款方银行名称","收款方银行大额支付行号/跨行清算行号","用途","明细标注"]
@@ -565,13 +560,13 @@ class TransferDialog(tk.Toplevel):
         self.title("新增/编辑 - 批量转账"); self.resizable(True, True)
         self.values = {}
         self.transfer_mode_map = {"0":"0 - 行内转账（同一银行）","1":"1 - 跨行转账（不同银行）"}
-        self.bankinfo_type_map = {"":"（空）不填","0":"0 - 跨行清算银行信息（IBPS）","1":"1 - 开户支行信息（开户支行名称/大额）"}
+        self.bankinfo_type_map = {"":"（空）不填","0":"0 - 跨行清算银行信息（IBPS）","1":"1 - 开户支行信息（开户支行/大额）"}
         container = ttk.Frame(self, padding=12); container.pack(fill="both", expand=True)
         container.grid_columnconfigure(1, weight=1)
         tips = {
             "转账方式":"0=行内；1=跨行（跨行需填写下方“行号”）",
             "行别信息类型":"可为空；0=跨行清算银行信息；1=开户支行信息。行内不填；银联卡号可不填。",
-            "行号":"支持手输或点击【选择…】从本地库选；选择后会自动带出银行名称，并根据是否“华夏银行”自动设置转账方式。",
+            "行号":"支持手输或点击【选择…】从本地库选；选择后自动带出银行名称，并根据是否“华夏银行”自动设置转账方式。",
             "可选项":"行内转账时不输入；收款方账号是银联卡号时可以不输入"
         }
         self.vars = {}; row=0
@@ -652,8 +647,7 @@ class TransferTab(ttk.Frame):
     COLS = ["收款方账号","收款方户名","金额","转账方式","行别信息类型",
             "收款方银行名称","收款方银行大额支付行号/跨行清算行号","用途","明细标注"]
     def __init__(self, master):
-        super().__init__(master)
-        self.df = pd.DataFrame(columns=self.COLS); self._build()
+        super().__init__(master); self.df = pd.DataFrame(columns=self.COLS); self._build()
     def _build(self):
         top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=8)
         ttk.Button(top, text="新增", command=self.add_one).pack(side="left")
@@ -665,37 +659,34 @@ class TransferTab(ttk.Frame):
         _apply_bg_to_tree(self.stree.tree, str(APP_DIR / "bg.jpg"), opacity=0.08)
         self._reload()
     def _reload(self):
-        tree = self.stree.tree; df = self.df
-        tree["columns"] = list(df.columns)
+        t=self.stree.tree; df=self.df
+        t["columns"]=list(df.columns)
         for col in df.columns:
-            tree.heading(col, text=col)
-            width = 220 if ("名称" in col or "用途" in col or "明细" in col) else 160
-            tree.column(col, width=width, anchor="w")
-        tree.delete(*tree.get_children())
-        for _, row in df.iterrows():
-            tree.insert("", "end", values=[str(row.get(c,"")) for c in df.columns])
+            t.heading(col, text=col); t.column(col, width=(220 if ("名称" in col or "用途" in col or "明细" in col) else 160), anchor="w")
+        t.delete(*t.get_children())
+        for _,row in df.iterrows():
+            t.insert("", "end", values=[str(row.get(c,"")) for c in df.columns])
     def add_one(self):
         dlg = TransferDialog(self); self.wait_window(dlg)
         if getattr(dlg, "values", None):
             self.df.loc[len(self.df)] = [dlg.values.get(c,"") for c in self.COLS]; self._reload()
     def edit_one(self):
-        tree = self.stree.tree; sel = tree.selection()
+        t = self.stree.tree; sel = t.selection()
         if not sel: messagebox.showinfo("提示","请先选择一行"); return
-        idx = tree.index(sel[0]); init = {c: str(self.df.iloc[idx][c]) for c in self.COLS}
+        idx = t.index(sel[0]); init = {c: str(self.df.iloc[idx][c]) for c in self.COLS}
         dlg = TransferDialog(self, init_values=init); self.wait_window(dlg)
         if getattr(dlg, "values", None):
             for c in self.COLS: self.df.at[self.df.index[idx], c] = dlg.values.get(c,"")
             self._reload()
     def delete_selected(self):
-        tree = self.stree.tree; sel = tree.selection()
+        t = self.stree.tree; sel = t.selection()
         if not sel: return
-        idx = tree.index(sel[0]); self.df = self.df.drop(self.df.index[idx]).reset_index(drop=True); self._reload()
+        idx = t.index(sel[0]); self.df = self.df.drop(self.df.index[idx]).reset_index(drop=True); self._reload()
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel/CSV","*.xlsx;*.xls;*.csv")])
         if not path: return
         try: df = read_any(path, header="auto")
-        except Exception as e:
-            messagebox.showerror("失败", f"读取失败：{e}"); return
+        except Exception as e: messagebox.showerror("失败", f"读取失败：{e}"); return
         need = self.COLS
         if not set(need).issubset(set(df.columns)):
             df = df.iloc[:, :9]; df.columns = need
@@ -714,8 +705,7 @@ class TransferTab(ttk.Frame):
             if mode=="1" and str(r["收款方银行大额支付行号/跨行清算行号"]).strip()=="":
                 errors.append(f"第{idx+1}行：跨行转账需提供行号")
         if errors:
-            messagebox.showerror("校验失败","导入中止：\n" + "\n".join(errors[:30]) + ("\n..." if len(errors)>30 else ""))
-            return
+            messagebox.showerror("校验失败","导入中止：\n" + "\n".join(errors[:30]) + ("\n..." if len(errors)>30 else "")); return
         self.df = df[self.COLS].astype(str); self._reload()
         messagebox.showinfo("成功", f"导入处理完成：有效 {len(self.df)} 行（共 {len(df)} 行）")
     def validate_export(self):
@@ -733,10 +723,8 @@ class TransferTab(ttk.Frame):
         if probs: messagebox.showwarning("校验结果","；".join(probs))
         path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel",".xlsx")])
         if not path: return
-        export_text_xlsx(self.df, path, include_header=True)
-        messagebox.showinfo("成功","已导出（保留表头，文本格式）")
+        export_text_xlsx(self.df, path, include_header=True); messagebox.showinfo("成功","已导出（保留表头，文本格式）")
 
-# 主应用
 def show_env_check():
     msgs = []; ok = True
     try:
@@ -758,16 +746,36 @@ def show_env_check():
         ok=False; msgs.append(f"xlrd: 未安装 ({e})")
     guide = ""
     if not ok:
-        guide = "\n\n修复指引（在命令行执行）：\n" + \
-                "pip uninstall -y xlrd\n" + \
-                "pip install xlrd==1.2.0\n" + \
-                "pip install numpy==2.0.1 openpyxl==3.1.2 pandas==2.2.2"
-    messagebox.showinfo("环境自检", "\n".join(msgs) + guide)
+        guide = "\\n\\n修复指引：pip uninstall -y xlrd && pip install xlrd==1.2.0 && pip install numpy==2.0.1 openpyxl==3.1.2 pandas==2.2.2"
+    messagebox.showinfo("环境自检", "\\n".join(msgs) + guide)
+
+def _repair_db_mojibake():
+    import sqlite3
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        total_changed = 0
+        for table, col in [("cnaps","name"), ("ibps","name")]:
+            cur.execute(f"SELECT code,{col} FROM {table}")
+            rows = cur.fetchall(); changed = 0
+            for code, name in rows:
+                fixed = fix_mojibake(name)
+                if fixed != name and str(fixed).strip():
+                    cur.execute(f"UPDATE {table} SET {col}=? WHERE code=?", (fixed, code))
+                    changed += 1
+                    if changed % 5000 == 0:
+                        conn.commit()
+            conn.commit()
+            total_changed += changed
+        conn.close()
+        messagebox.showinfo("修复完成", f"已尝试修复中文乱码，共修改 {total_changed} 条记录。")
+    except Exception as e:
+        messagebox.showerror("失败", f"修复失败：{e}")
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("华夏离线批量编辑器 v2.3.6-r5")
+        self.title("华夏离线批量编辑器 v2.3.6-r6")
         self.minsize(1200, 760)
         try: self.iconbitmap(str(APP_DIR / "icon.ico"))
         except Exception: pass
@@ -788,10 +796,13 @@ class App(tk.Tk):
         viewm.add_radiobutton(label='透明度 8%',  command=lambda: _opacity(0.08))
         viewm.add_radiobutton(label='透明度 12%', command=lambda: _opacity(0.12))
         menubar.add_cascade(label='视图', menu=viewm)
+        toolm = tk.Menu(menubar, tearoff=0)
+        toolm.add_command(label="修复已导入乱码…", command=_repair_db_mojibake)
+        menubar.add_cascade(label="工具", menu=toolm)
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="环境自检与修复…", command=show_env_check)
         helpm.add_separator()
-        helpm.add_command(label="关于", command=lambda: messagebox.showinfo("关于","华夏离线批量编辑器 v2.3.6-r5"))
+        helpm.add_command(label="关于", command=lambda: messagebox.showinfo("关于","华夏离线批量编辑器 v2.3.6-r6"))
         menubar.add_cascade(label="帮助", menu=helpm)
         self.config(menu=menubar)
         nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
