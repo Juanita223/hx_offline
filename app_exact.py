@@ -3,17 +3,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 from pathlib import Path
-import os, re, csv, zipfile, sys, importlib
+import os, re, csv, zipfile, importlib
 from PIL import Image, ImageTk
 
-try:
-    import openpyxl  # noqa: F401
-except Exception:
-    openpyxl = None
-try:
-    import xlrd  # noqa: F401
-except Exception:
-    xlrd = None
+# engines
+try: import openpyxl   # noqa
+except Exception: openpyxl = None
+try: import xlrd       # noqa
+except Exception: xlrd = None
 
 from db_helper import ensure_db, upsert_many_batched, replace_all, query
 
@@ -36,15 +33,14 @@ def sniff_delimiter(text: str):
                 best, bestn = d, n
         return best or ","
 
-
 def try_parse_csv(path: str, header="auto"):
-    """更稳健的 CSV 解析：多编码兜底 + header 自动回退（0 -> None）。"""
+    """稳健 CSV：多编码兜底 + 自动表头回退"""
     from io import TextIOWrapper, BytesIO
     data = Path(path).read_bytes()
     last_err = None
     for enc in COMMON_ENCODINGS:
         try:
-            # 先尝试 header=0
+            # header=0
             bio = BytesIO(data); tio = TextIOWrapper(bio, encoding=enc, newline="")
             df = pd.read_csv(tio, dtype=str, engine="python", sep=None, on_bad_lines="skip", header=0)
             empty = (df is None) or (getattr(df, "empty", False)) or (len(df)==0)
@@ -56,13 +52,12 @@ def try_parse_csv(path: str, header="auto"):
         except Exception as e:
             last_err = e
             continue
-    # 所有编码都失败
     if last_err:
         raise last_err
     return pd.DataFrame()
 
-
 def try_parse_txt(path: str):
+    """智能 TXT：多编码 + 分隔符嗅探 + 宽松解析"""
     from io import StringIO
     data = Path(path).read_bytes()
     for enc in COMMON_ENCODINGS:
@@ -72,18 +67,16 @@ def try_parse_txt(path: str):
             continue
         s = s.replace("\r\n","\n").replace("\r","\n")
         if s and s[0] == "\ufeff": s = s[1:]
-        try:
-            delim = sniff_delimiter(s)
-        except Exception:
-            delim = None
-        def try_read(sep):
+        try: delim = sniff_delimiter(s)
+        except Exception: delim = None
+        def _read(sep):
             sio = StringIO(s)
             return pd.read_csv(sio, sep=sep, header=None, dtype=str, engine="python",
                                quoting=3, on_bad_lines="skip", escapechar="\\").dropna(axis=1, how="all").dropna(axis=0, how="all")
         for sep in [delim, "|","\t",",",";","\s+"]:
             if not sep: continue
             try:
-                df = try_read(sep)
+                df = _read(sep)
                 if df is not None and not df.empty: break
             except Exception:
                 df = None
@@ -101,28 +94,24 @@ def try_parse_txt(path: str):
     raise RuntimeError("无法解析 TXT：请另存为 CSV/Excel 再导入。")
 
 def read_any(path: str, header="auto"):
+    """统一入口：header='auto' 先表头再无表头回退"""
     p = Path(path); ext = p.suffix.lower()
     def _maybe_fallback(df_loader):
         if header != "auto":
             return df_loader(header)
         df = df_loader(0)
-        try:
-            empty = (df is None) or (getattr(df, "empty", False)) or (len(df)==0)
-        except Exception:
-            empty = False
+        empty = (df is None) or (getattr(df, "empty", False)) or (len(df)==0)
         if empty:
-            try:
-                return df_loader(None)
-            except Exception:
-                return df
+            try: return df_loader(None)
+            except Exception: return df
         return df
     if ext in [".xlsx",".xlsm",".xltx",".xltm"]:
         if not zipfile.is_zipfile(path):
-            raise RuntimeError("扩展名为 .xlsx，但内容不是 Office Open XML（可能被错误改名）。请改回正确扩展名或另存为 .xlsx 再试。")
+            raise RuntimeError("扩展名为 .xlsx，但内容不是 Office Open XML（可能被误改名）。请另存为 .xlsx 再试。")
         return _maybe_fallback(lambda h: pd.read_excel(path, engine="openpyxl", dtype=str, header=h))
     if ext == ".xls":
         if xlrd is None or getattr(importlib.import_module('xlrd'), '__version__', '') != '1.2.0':
-            raise RuntimeError("读取 .xls 需要 xlrd==1.2.0，请在“帮助→环境自检与修复”查看修复指引，或将文件另存为 .xlsx/CSV。")
+            raise RuntimeError("读取 .xls 需要 xlrd==1.2.0，请在“帮助→环境自检与修复”查看修复指引，或另存为 .xlsx/CSV。")
         return _maybe_fallback(lambda h: pd.read_excel(path, engine="xlrd", dtype=str, header=h))
     if ext == ".csv":
         return try_parse_csv(path, header=header)
@@ -144,34 +133,24 @@ def export_text_xlsx(df: pd.DataFrame, path: str, *, include_header: bool = True
             cell = ws.cell(row=i, column=j, value=val); cell.number_format="@"
     wb.save(path)
 
-
-# ---- 背景：为 Treeview 设置图片底纹（可见） ----
+# ---- 背景：Treeview 直接底纹可见 ----
 def _apply_bg_to_tree(tree: ttk.Treeview, img_path: str, opacity: float = 0.08):
-    """把图片作为 Treeview 的 field 背景（通过 ttk.Style 元素），随着尺寸变化重绘。
-    注意：PhotoImage 需保留引用；每棵树使用独立的 style 名称，避免冲突。
-    """
+    """通过 ttk.Style 把图片作为 Treeview 的 field 背景，并随尺寸自适应重绘"""
     from PIL import Image, ImageTk
     import hashlib
     key = f"TVBG_{hashlib.md5(str(id(tree)).encode()).hexdigest()[:8]}"
     tree._bg_style_name = key + ".Treeview"
     tree._bg_field_name = key + ".field"
     style = ttk.Style(tree)
-
     def _render(event=None):
         try:
-            if not Path(img_path).exists():
-                return
-            w = max(32, tree.winfo_width())
-            h = max(32, tree.winfo_height())
-            if w <= 0 or h <= 0:
-                return
-            from PIL import Image
+            if not Path(img_path).exists(): return
+            w = max(32, tree.winfo_width()); h = max(32, tree.winfo_height())
+            if w <= 0 or h <= 0: return
             pil = Image.open(img_path).convert("RGBA")
             scale = max(w / max(1,pil.width), h / max(1,pil.height))
-            new_size = (int(pil.width * scale), int(pil.height * scale))
-            im = pil.resize(new_size, Image.LANCZOS)
-            left = max(0, (im.width - w) // 2)
-            top  = max(0, (im.height - h) // 2)
+            im = pil.resize((int(pil.width*scale), int(pil.height*scale)), Image.LANCZOS)
+            left = max(0, (im.width - w) // 2); top = max(0, (im.height - h) // 2)
             im = im.crop((left, top, left + w, top + h))
             fg = im.copy(); fg.putalpha(int(255*opacity))
             bg = Image.new("RGBA", im.size, (255,255,255,255))
@@ -189,44 +168,54 @@ def _apply_bg_to_tree(tree: ttk.Treeview, img_path: str, opacity: float = 0.08):
             tree.configure(style=tree._bg_style_name)
         except Exception:
             pass
+    tree.bind("<Configure>", _render, add="+"); tree.after(100, _render)
 
-    tree.bind("<Configure>", _render, add="+")
-    tree.after(100, _render)
+# 容器控件
+class ScrollableTree(ttk.Frame):
+    def __init__(self, master, **kwargs):
+        super().__init__(master)
+        self.tree = ttk.Treeview(self, show="headings", **kwargs)
+        xbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        ybar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        self.tree.configure(xscrollcommand=xbar.set, yscrollcommand=ybar.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        xbar.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-# 背景水印
-def _install_watermark(frame, img_path, opacity=0.08):
-    if not Path(img_path).exists(): return
-    canvas = getattr(frame, "_bg_canvas", None)
-    if canvas is None:
-        canvas = tk.Canvas(frame, borderwidth=0, highlightthickness=0)
-        canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        canvas.lower()
-        frame._bg_canvas = canvas
-    pil = getattr(frame, "_bg_pil", None)
-    if pil is None or getattr(frame, "_bg_src", "") != str(img_path):
-        try:
-            pil = Image.open(img_path).convert("RGBA")
-        except Exception:
-            return
-        frame._bg_pil = pil; frame._bg_src = str(img_path)
-    def _render(event=None):
-        if not hasattr(frame, "_bg_pil"): return
-        w = max(10, frame.winfo_width()); h = max(10, frame.winfo_height())
-        if w < 10 or h < 10: return
-        pil = frame._bg_pil
-        scale = max(w / pil.width, h / pil.height)
-        new_size = (int(pil.width * scale), int(pil.height * scale))
-        im = pil.resize(new_size, Image.LANCZOS)
-        left = (im.width - w) // 2; top = (im.height - h) // 2
-        im = im.crop((max(0,left), max(0,top), max(w, left+w), max(h, top+h)))
-        fg = im.copy(); fg.putalpha(int(255*0.08))
-        bg = Image.new("RGBA", im.size, (255,255,255,255))
-        im = Image.alpha_composite(bg, fg).convert("RGB")
-        frame._bg_imgtk = ImageTk.PhotoImage(im)
-        canvas.delete("all"); canvas.create_image(0, 0, image=frame._bg_imgtk, anchor="nw")
-    frame.bind("<Configure>", _render); frame.after(50, _render)
+class ScrollableForm(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        hsb = ttk.Scrollbar(self, orient="horizontal", command=canvas.xview)
+        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.inner = ttk.Frame(canvas)
+        self.inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-# IBPS/CNAPS helpers (omitted comments for brevity)
+def center_and_autosize(win, min_w=760, min_h=420, pad=24):
+    win.update_idletasks()
+    req_w = max(min_w, win.winfo_reqwidth() + pad)
+    req_h = max(min_h, win.winfo_reqheight() + pad)
+    try:
+        parent = win.master.winfo_toplevel()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        x = px + max(0, (pw - req_w)//2)
+        y = py + max(0, (ph - req_h)//2)
+    except Exception:
+        x, y = 100, 100
+    win.minsize(req_w, req_h)
+    win.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+# 数据抽取
 def _locate_header_row_for_ibps(df):
     scan = df.head(30).astype(str).fillna("")
     k_code = ["清算行行号","清算行号","联行号","行号","行号代码","清算行行号代码"]
@@ -300,50 +289,7 @@ def pick_cnaps(df):
     use = use[(use["BNKCODE"]!="") & (use["LNAME"]!="")].drop_duplicates(subset=["BNKCODE"]).reset_index(drop=True)
     return use
 
-class ScrollableTree(ttk.Frame):
-    def __init__(self, master, **kwargs):
-        super().__init__(master)
-        self.tree = ttk.Treeview(self, show="headings", **kwargs)
-        xbar = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
-        ybar = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
-        self.tree.configure(xscrollcommand=xbar.set, yscrollcommand=ybar.set)
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        ybar.grid(row=0, column=1, sticky="ns")
-        xbar.grid(row=1, column=0, sticky="ew")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-class ScrollableForm(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
-        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
-        hsb = ttk.Scrollbar(self, orient="horizontal", command=canvas.xview)
-        vsb = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        self.inner = ttk.Frame(canvas)
-        self.inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        self.grid_rowconfigure(0, weight=1)
-        self.grid_columnconfigure(0, weight=1)
-
-def center_and_autosize(win, min_w=760, min_h=420, pad=24):
-    win.update_idletasks()
-    req_w = max(min_w, win.winfo_reqwidth() + pad)
-    req_h = max(min_h, win.winfo_reqheight() + pad)
-    try:
-        parent = win.master.winfo_toplevel()
-        px, py = parent.winfo_rootx(), parent.winfo_rooty()
-        pw, ph = parent.winfo_width(), parent.winfo_height()
-        x = px + max(0, (pw - req_w)//2)
-        y = py + max(0, (ph - req_h)//2)
-    except Exception:
-        x, y = 100, 100
-    win.minsize(req_w, req_h)
-    win.geometry(f"{req_w}x{req_h}+{x}+{y}")
-
+# 选择框
 class CodePicker(tk.Toplevel):
     def __init__(self, master, default_source="ibps", ibps_only=False):
         super().__init__(master)
@@ -381,8 +327,7 @@ class CodePicker(tk.Toplevel):
     def search(self):
         rows = query(DB_PATH, self.source.get(), self.kw.get().strip(), limit=5000)
         tree = self.stree.tree; tree.delete(*tree.get_children())
-        for r in rows:
-            tree.insert("", "end", values=[r["code"], r["name"]])
+        for r in rows: tree.insert("", "end", values=[r["code"], r["name"]])
 
     def pick(self):
         tree = self.stree.tree; sel = tree.selection()
@@ -391,6 +336,7 @@ class CodePicker(tk.Toplevel):
         self.selected_row = (vals[0], vals[1])
         self.destroy()
 
+# 库维护
 class LibraryTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -410,14 +356,12 @@ class LibraryTab(ttk.Frame):
         ttk.Button(top, text="查询", command=self.search).pack(side="left", padx=6)
 
         self.stree = ScrollableTree(self); self.stree.pack(fill="both", expand=True, padx=8, pady=6)
-        try: _install_watermark(self, str(APP_DIR / "bg.jpg"), opacity=0.08)
-        except Exception: pass
+        _apply_bg_to_tree(self.stree.tree, str(APP_DIR / "bg.jpg"), opacity=0.08)
 
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("TXT/Excel/CSV","*.txt;*.dat;*.xls;*.xlsx;*.csv"),("所有文件","*.*")])
         if not path: return
-        try:
-            df = read_any(path, header="auto")
+        try: df = read_any(path, header="auto")
         except Exception as e:
             messagebox.showerror("失败", f"读取失败：{e}"); return
         rows = []; raw_src = os.path.basename(path)
@@ -443,7 +387,8 @@ class LibraryTab(ttk.Frame):
             replace_all(DB_PATH, table, rows)
         else:
             upsert_many_batched(DB_PATH, table, rows, batch_size=20000)
-        messagebox.showinfo("成功", f"导入完成：共 {len(rows)} 条"); self.search()
+        messagebox.showinfo("成功", f"导入完成：共 {len(rows)} 条")
+        self.search()  # 导入后自动刷新
 
     def search(self):
         table = self.table_choice.get()
@@ -458,8 +403,7 @@ class LibraryTab(ttk.Frame):
             messagebox.showinfo("提示","当前库为空"); return
         import pandas as pd
         df = pd.DataFrame(rows)
-        path = filedialog.asksaveasfilename(defaultextension=".xlsx",
-                                            filetypes=[("Excel",".xlsx"),("CSV",".csv")])
+        path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel",".xlsx"),("CSV",".csv")])
         if not path: return
         try:
             if path.lower().endswith(".csv"):
@@ -483,15 +427,14 @@ class LibraryTab(ttk.Frame):
             if len(batch) >= 2000:
                 for vals in batch: tree.insert("", "end", values=vals)
                 batch.clear(); tree.update_idletasks()
-        for vals in batch:
-            tree.insert("", "end", values=vals)
+        for vals in batch: tree.insert("", "end", values=vals)
 
+# 代发工资
 class PayrollDialog(tk.Toplevel):
     COLS = ["收款人银行名称","收款人卡号","收款人名称","金额"]
     def __init__(self, master, init_values=None):
         super().__init__(master)
         self.title("新增/编辑 - 代发工资"); self.resizable(True, True)
-        self.values = {}
         sf = ScrollableForm(self); sf.pack(fill="both", expand=True)
         frm = sf.inner
         self.vars = {}
@@ -507,7 +450,7 @@ class PayrollDialog(tk.Toplevel):
         ttk.Label(frm, text="（可点击“选择…”从 IBPS 库带出银行名称）", foreground="#666").grid(row=0, column=2, sticky="w", padx=6)
         self.vars["收款人银行名称"] = v_bank
         for i, col in enumerate(["收款人卡号","收款人名称","金额"], start=1):
-            ttk.Label(frm, text=col + "：").grid(row=i, column=0, sticky="e", padx=6, pady=6)
+            ttk.Label(frm, text=col+"：").grid(row=i, column=0, sticky="e", padx=6, pady=6)
             var = tk.StringVar(value=(init_values.get(col,"") if init_values else ""))
             ttk.Entry(frm, textvariable=var, width=36).grid(row=i, column=1, sticky="w", padx=6, pady=6)
             self.vars[col] = var
@@ -516,7 +459,6 @@ class PayrollDialog(tk.Toplevel):
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
         self.bind("<Return>", lambda e: self.ok())
         self.after(10, lambda: center_and_autosize(self, min_w=760, min_h=420))
-
     def ok(self):
         vals = {k: v.get().strip() for k, v in self.vars.items()}
         probs = []
@@ -528,7 +470,7 @@ class PayrollDialog(tk.Toplevel):
             probs.append("金额 不是有效数字")
         if not vals["收款人名称"]: probs.append("收款人名称 不能为空")
         if probs:
-            messagebox.showwarning("校验不通过", "；".join(probs)); return
+            messagebox.showwarning("校验不通过","；".join(probs)); return
         self.values = vals; self.destroy()
 
 class PayrollTab(ttk.Frame):
@@ -537,7 +479,6 @@ class PayrollTab(ttk.Frame):
         super().__init__(master)
         self.df = pd.DataFrame(columns=self.COLS)
         self._build()
-
     def _build(self):
         top = ttk.Frame(self); top.pack(fill="x", padx=8, pady=8)
         ttk.Button(top, text="新增", command=self.add_one).pack(side="left")
@@ -546,44 +487,29 @@ class PayrollTab(ttk.Frame):
         ttk.Button(top, text="导入代发工资文件", command=self.import_file).pack(side="left", padx=12)
         ttk.Button(top, text="校验并导出（无表头）", command=self.validate_export).pack(side="left", padx=6)
         self.stree = ScrollableTree(self, height=18); self.stree.pack(fill="both", expand=True, padx=8, pady=6)
-        try: _install_watermark(self, str(APP_DIR / "bg.jpg"), opacity=0.08)
-        except Exception: pass
+        _apply_bg_to_tree(self.stree.tree, str(APP_DIR / "bg.jpg"), opacity=0.08)
         self._reload()
-
     def _reload(self):
-        tree = self.stree.tree
-        df = self.df.fillna("")
+        tree = self.stree.tree; df = self.df.fillna("")
         tree["columns"] = list(self.COLS)
         for col in self.COLS:
-            tree.heading(col, text=col)
-            width = 240 if "银行名称" in col else 180
-            tree.column(col, width=width, anchor="w")
+            tree.heading(col, text=col); tree.column(col, width=(240 if "银行名称" in col else 180), anchor="w")
         tree.delete(*tree.get_children())
         for _, row in df.iterrows():
             tree.insert("", "end", values=[str(row.get(c,"")) for c in self.COLS])
-
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel/CSV","*.xlsx;*.xls;*.csv"), ("所有文件","*.*")])
         if not path: return
-        try:
-            df = read_any(path, header="auto")
+        try: df = read_any(path, header="auto")
         except Exception as e:
             messagebox.showerror("失败", f"读取失败：{e}"); return
-
         cols = [str(c).strip().replace("\ufeff","") for c in list(df.columns)]
-        if set(self.COLS).issubset(set(cols)):
-            df = df[self.COLS].copy()
-        else:
-            df = df.iloc[:, :4].copy()
-            df.columns = self.COLS
-
-        def _strip(s):
-            return "" if pd.isna(s) else str(s).replace("\u3000"," ").strip()
-        for c in self.COLS:
-            df[c] = df[c].map(_strip)
+        if set(self.COLS).issubset(set(cols)): df = df[self.COLS].copy()
+        else: df = df.iloc[:, :4].copy(); df.columns = self.COLS
+        def _strip(s): return "" if pd.isna(s) else str(s).replace("\u3000"," ").strip()
+        for c in self.COLS: df[c] = df[c].map(_strip)
         df = df[~(df[self.COLS].apply(lambda r: all(x=="" for x in r), axis=1))].reset_index(drop=True)
-
-        warnings = []; bad_rows = []
+        bad_rows = []
         for idx, r in df.iterrows():
             ok = True
             if r["收款人银行名称"] == "": ok = False
@@ -594,23 +520,16 @@ class PayrollTab(ttk.Frame):
                 ok = False
             if r["收款人名称"] == "": ok = False
             if not ok: bad_rows.append(idx)
-        if bad_rows:
-            df = df.drop(index=bad_rows).reset_index(drop=True)
-
-        self.df = df
-        self._reload()
-        total = len(df) + len(bad_rows)
-        shown = len(self.df)
+        if bad_rows: df = df.drop(index=bad_rows).reset_index(drop=True)
+        self.df = df; self._reload()
+        total = len(df) + len(bad_rows); shown = len(self.df)
         msg = f"导入处理完成：源行数 {total}，有效 {shown} 行"
-        if bad_rows:
-            msg += f"；已跳过 {len(bad_rows)} 行"
+        if bad_rows: msg += f"；已跳过 {len(bad_rows)} 行"
         messagebox.showinfo("成功", msg)
-
     def add_one(self):
         dlg = PayrollDialog(self); self.wait_window(dlg)
         if getattr(dlg, "values", None):
             self.df.loc[len(self.df)] = [dlg.values.get(c,"") for c in self.COLS]; self._reload()
-
     def edit_one(self):
         tree = self.stree.tree; sel = tree.selection()
         if not sel: messagebox.showinfo("提示","请先选择一行"); return
@@ -619,12 +538,10 @@ class PayrollTab(ttk.Frame):
         if getattr(dlg, "values", None):
             for c in self.COLS: self.df.at[self.df.index[idx], c] = dlg.values.get(c,"")
             self._reload()
-
     def delete_selected(self):
         tree = self.stree.tree; sel = tree.selection()
         if not sel: return
         idx = tree.index(sel[0]); self.df = self.df.drop(self.df.index[idx]).reset_index(drop=True); self._reload()
-
     def validate_export(self):
         df = self.df.fillna("")
         probs = []
@@ -632,14 +549,14 @@ class PayrollTab(ttk.Frame):
         if (~df["收款人卡号"].astype(str).str.match(r"^\d{6,32}$", na=False)).any(): probs.append("存在 卡号 非6-32位数字")
         try:
             if (pd.to_numeric(df["金额"], errors="coerce")<=0).any(): probs.append("存在 金额≤0 或非数字")
-        except Exception:
-            probs.append("金额列解析异常")
+        except Exception: probs.append("金额列解析异常")
         if probs: messagebox.showwarning("校验结果","；".join(probs))
         path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel",".xlsx")])
         if not path: return
         export_text_xlsx(self.df, path, include_header=False)
         messagebox.showinfo("成功","已导出（无表头，文本格式）")
 
+# 批量转账
 class TransferDialog(tk.Toplevel):
     COLS = ["收款方账号","收款方户名","金额","转账方式","行别信息类型",
             "收款方银行名称","收款方银行大额支付行号/跨行清算行号","用途","明细标注"]
@@ -710,7 +627,6 @@ class TransferDialog(tk.Toplevel):
         ttk.Button(btns, text="取消", command=self.destroy).pack(side="right")
         self.bind("<Return>", lambda e: self.ok())
         self.after(10, lambda: center_and_autosize(self, min_w=880, min_h=560))
-
     def ok(self):
         inverse_mode = {v:k for k,v in self.transfer_mode_map.items()}
         inverse_btype= {v:k for k,v in self.bankinfo_type_map.items()}
@@ -746,12 +662,10 @@ class TransferTab(ttk.Frame):
         ttk.Button(top, text="导入批量转账文件", command=self.import_file).pack(side="left", padx=12)
         ttk.Button(top, text="校验并导出（保留表头）", command=self.validate_export).pack(side="left", padx=6)
         self.stree = ScrollableTree(self, height=18); self.stree.pack(fill="both", expand=True, padx=8, pady=6)
-        try: _install_watermark(self, str(APP_DIR / "bg.jpg"), opacity=0.08)
-        except Exception: pass
+        _apply_bg_to_tree(self.stree.tree, str(APP_DIR / "bg.jpg"), opacity=0.08)
         self._reload()
     def _reload(self):
-        tree = self.stree.tree
-        df = self.df
+        tree = self.stree.tree; df = self.df
         tree["columns"] = list(df.columns)
         for col in df.columns:
             tree.heading(col, text=col)
@@ -779,14 +693,12 @@ class TransferTab(ttk.Frame):
     def import_file(self):
         path = filedialog.askopenfilename(filetypes=[("Excel/CSV","*.xlsx;*.xls;*.csv")])
         if not path: return
-        try:
-            df = read_any(path, header="auto")
+        try: df = read_any(path, header="auto")
         except Exception as e:
             messagebox.showerror("失败", f"读取失败：{e}"); return
         need = self.COLS
         if not set(need).issubset(set(df.columns)):
-            df = df.iloc[:, :9]
-            df.columns = need
+            df = df.iloc[:, :9]; df.columns = need
         errors = []
         for idx, r in df.fillna("").iterrows():
             if not re.fullmatch(r"\d{6,32}", str(r["收款方账号"])): errors.append(f"第{idx+1}行：收款方账号 非6-32位数字")
@@ -802,14 +714,14 @@ class TransferTab(ttk.Frame):
             if mode=="1" and str(r["收款方银行大额支付行号/跨行清算行号"]).strip()=="":
                 errors.append(f"第{idx+1}行：跨行转账需提供行号")
         if errors:
-            messagebox.showerror("校验失败","导入中止：\\n" + "\\n".join(errors[:30]) + ("\\n..." if len(errors)>30 else ""))
+            messagebox.showerror("校验失败","导入中止：\n" + "\n".join(errors[:30]) + ("\n..." if len(errors)>30 else ""))
             return
         self.df = df[self.COLS].astype(str); self._reload()
         messagebox.showinfo("成功", f"导入处理完成：有效 {len(self.df)} 行（共 {len(df)} 行）")
     def validate_export(self):
         df = self.df.fillna("")
         probs = []
-        if (~df["收款方账号"].astype(str).str.match(r"^\\d{6,32}$", na=False)).any(): probs.append("收款方账号 格式异常")
+        if (~df["收款方账号"].astype(str).str.match(r"^\d{6,32}$", na=False)).any(): probs.append("收款方账号 格式异常")
         if df["收款方户名"].str.strip().eq("").any(): probs.append("收款方户名 不能为空")
         try:
             if (pd.to_numeric(df["金额"], errors="coerce")<=0).any(): probs.append("金额 必须大于0")
@@ -824,8 +736,13 @@ class TransferTab(ttk.Frame):
         export_text_xlsx(self.df, path, include_header=True)
         messagebox.showinfo("成功","已导出（保留表头，文本格式）")
 
+# 主应用
 def show_env_check():
     msgs = []; ok = True
+    try:
+        import numpy as _n; msgs.append(f"numpy: {_n.__version__}")
+    except Exception as e:
+        ok=False; msgs.append(f"numpy: 未安装 ({e})")
     try:
         import pandas as _p; msgs.append(f"pandas: {_p.__version__}")
     except Exception as e:
@@ -841,32 +758,29 @@ def show_env_check():
         ok=False; msgs.append(f"xlrd: 未安装 ({e})")
     guide = ""
     if not ok:
-        guide = "\\n\\n修复指引（在命令行执行）：\\n" + \
-                "pip uninstall -y xlrd\\n" + \
-                "pip install xlrd==1.2.0\\n" + \
-                "pip install openpyxl==3.1.2 pandas==2.2.2"
-    messagebox.showinfo("环境自检", "\\n".join(msgs) + guide)
+        guide = "\n\n修复指引（在命令行执行）：\n" + \
+                "pip uninstall -y xlrd\n" + \
+                "pip install xlrd==1.2.0\n" + \
+                "pip install numpy==2.0.1 openpyxl==3.1.2 pandas==2.2.2"
+    messagebox.showinfo("环境自检", "\n".join(msgs) + guide)
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("华夏离线批量编辑器 v2.3.6-r3-hf1")
+        self.title("华夏离线批量编辑器 v2.3.6-r5")
         self.minsize(1200, 760)
         try: self.iconbitmap(str(APP_DIR / "icon.ico"))
         except Exception: pass
         ensure_db(DB_PATH)
-
         menubar = tk.Menu(self)
         viewm = tk.Menu(menubar, tearoff=0)
         def _choose_bg():
             p = filedialog.askopenfilename(title='选择背景图片', filetypes=[('图片','*.jpg;*.jpeg;*.png;*.webp;*.bmp')])
             if not p: return
-            for tab in self.notebook_tabs: _install_watermark(tab, p, opacity=getattr(self, "_bg_opacity", 0.08))
             for tv in getattr(self, "_all_trees", []): _apply_bg_to_tree(tv, p, opacity=getattr(self, "_bg_opacity", 0.08))
         def _opacity(val=None):
             try: self._bg_opacity = float(val)
             except Exception: self._bg_opacity = 0.08
-            for tab in self.notebook_tabs: _install_watermark(tab, str(APP_DIR / "bg.jpg"), opacity=self._bg_opacity)
             for tv in getattr(self, "_all_trees", []): _apply_bg_to_tree(tv, str(APP_DIR / "bg.jpg"), opacity=self._bg_opacity)
         viewm.add_command(label='设置背景图…', command=_choose_bg)
         viewm.add_separator()
@@ -874,32 +788,18 @@ class App(tk.Tk):
         viewm.add_radiobutton(label='透明度 8%',  command=lambda: _opacity(0.08))
         viewm.add_radiobutton(label='透明度 12%', command=lambda: _opacity(0.12))
         menubar.add_cascade(label='视图', menu=viewm)
-
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="环境自检与修复…", command=show_env_check)
         helpm.add_separator()
-        helpm.add_command(label="关于", command=lambda: messagebox.showinfo("关于","华夏离线批量编辑器 v2.3.6-r3-hf1"))
+        helpm.add_command(label="关于", command=lambda: messagebox.showinfo("关于","华夏离线批量编辑器 v2.3.6-r5"))
         menubar.add_cascade(label="帮助", menu=helpm)
         self.config(menu=menubar)
-
         nb = ttk.Notebook(self); nb.pack(fill="both", expand=True)
         t1 = LibraryTab(nb); t2 = PayrollTab(nb); t3 = TransferTab(nb)
         nb.add(t1, text="库维护（IBPS/CNAPS 导入）")
         nb.add(t2, text="代发工资录入")
         nb.add(t3, text="批量转账录入")
-        self.notebook_tabs = [t1, t2, t3]
-
-        self._all_trees = []
-        try:
-            self._all_trees.extend([t1.stree.tree, t2.stree.tree, t3.stree.tree])
-        except Exception:
-            pass
-        for tab in self.notebook_tabs:
-            try: _install_watermark(tab, str(APP_DIR / "bg.jpg"), opacity=getattr(self, "_bg_opacity", 0.08))
-            except Exception: pass
-        for tv in getattr(self, "_all_trees", []):
-            try: _apply_bg_to_tree(tv, str(APP_DIR / "bg.jpg"), opacity=0.08)
-            except Exception: pass
+        self._all_trees = [t1.stree.tree, t2.stree.tree, t3.stree.tree]
 
 if __name__ == "__main__":
     App().mainloop()

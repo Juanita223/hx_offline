@@ -1,7 +1,7 @@
 
 import sqlite3
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, Tuple, List
 
 def ensure_db(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
@@ -64,9 +64,8 @@ def query(db_path: str, table: str, keyword: str, limit: int = 1000):
     conn = sqlite3.connect(db_path); conn.row_factory = sqlite3.Row
     cur = conn.cursor()
     kw = f"%{keyword}%"
-    cur.execute(f"""SELECT code, name FROM {table}
-                    WHERE code LIKE ? OR name LIKE ?
-                    ORDER BY name LIMIT ?""", (kw, kw, limit))
+    cur.execute(f"SELECT code, name FROM {table} WHERE code LIKE ? OR name LIKE ? ORDER BY name LIMIT ?",
+                (kw, kw, limit))
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
